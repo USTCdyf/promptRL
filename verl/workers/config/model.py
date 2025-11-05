@@ -41,6 +41,8 @@ class HFModelConfig(BaseConfig):
         "architectures",
         "local_hf_config_path",
         "local_tokenizer_path",
+        "prompt_tuning",
+        "soft_prompt_path",
     }
 
     path: str = MISSING
@@ -90,6 +92,16 @@ class HFModelConfig(BaseConfig):
 
     architectures: Optional[list[str]] = None
 
+    prompt_tuning: dict = field(
+        default_factory=lambda: {
+            "enable": True,          # 是否开启 prompt tuning
+            "length": 20,             # soft prompt 的 token/embedding 数
+            "lr": 1e-3,               # soft prompt 的学习率（若训练）
+            "init_from_vocab": True,  # 是否用词表向量初始化
+            "freeze_backbone": True,  # 是否只训 soft prompt 而冻结主干
+        }
+    )
+
     def __post_init__(self):
         import_external_libs(self.external_lib)
 
@@ -99,6 +111,10 @@ class HFModelConfig(BaseConfig):
             self.tokenizer_path = self.path
 
         self.local_path = copy_to_local(self.path, use_shm=self.use_shm)
+
+        if self.soft_prompt_path is None and self.local_path is not None:
+            # e.g. <local model dir>/soft_prompt.pt
+            self.soft_prompt_path = os.path.join(self.local_path, "soft_prompt.pt")
 
         # constuct tokenizer
         if self.load_tokenizer:
@@ -139,6 +155,10 @@ class HFModelConfig(BaseConfig):
             self.override_config["model_config"] if "model_config" in self.override_config else self.override_config
         )
         override_config_kwargs.update(override_config)
+        # expose prompt_tuning flags into hf_config for downstream components
+        if isinstance(self.prompt_tuning, dict):
+            override_config_kwargs.setdefault("prompt_tuning_enable", self.prompt_tuning.get("enable", False))
+            override_config_kwargs.setdefault("prompt_tuning_length", self.prompt_tuning.get("length", 20))
         update_model_config(self.hf_config, override_config_kwargs=override_config_kwargs)
 
         self.share_embeddings_and_output_weights = getattr(self.hf_config, "tie_word_embeddings", False)

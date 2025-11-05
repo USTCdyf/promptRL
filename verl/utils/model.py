@@ -765,3 +765,17 @@ def get_lora_rank_from_adapter(adapter_path: str | os.PathLike) -> int:
 class CausalLMOutputForPPO(CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+
+def save_soft_prompt(actor, save_dir):
+    """Save soft prompt tensor for later inference."""
+    if hasattr(actor, "soft_prompt"):
+        save_path = f"{save_dir}/soft_prompt.pt"
+        torch.save({"soft_prompt": actor.soft_prompt.detach().cpu()}, save_path)
+        print(f"[SoftPrompt] Saved to {save_path}")
+    else:
+        print("[SoftPrompt] No soft prompt found, skipping save.")
+
+def load_soft_prompt(path, device):
+    """Load soft prompt tensor from file."""
+    data = torch.load(path, map_location=device)
+    return data["soft_prompt"]

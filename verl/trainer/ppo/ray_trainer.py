@@ -765,6 +765,24 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
         self.actor_rollout_wg.init_model()
 
+         # === Soft Prompt Adapter: 自动加载 soft_prompt ===
+        try:
+            rollout_cfg = self.config.actor_rollout_ref.rollout
+            if getattr(rollout_cfg, "enable_prompt_adapter", False) and getattr(rollout_cfg, "prompt_adapter_path", None):
+                from verl.utils.model import load_soft_prompt
+                prompt_path = rollout_cfg.prompt_adapter_path
+                device = torch.device(self.device_name if torch.cuda.is_available() else "cpu")
+                soft_prompt = load_soft_prompt(prompt_path, device)
+                self.actor_rollout_wg.update_weights(
+                    weights=None,
+                    prompt_adapter_tensors={"soft_prompt": soft_prompt},
+                )
+                print(f"[SoftPrompt] Loaded soft prompt from {prompt_path}")
+            else:
+                print("[SoftPrompt] Adapter disabled or path not set; skipping load.")
+        except Exception as e:
+            print(f"[SoftPrompt] Warning: failed to load soft prompt. Error: {e}")
+            
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":

@@ -68,6 +68,12 @@ except ModuleNotFoundError:
     # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
+try:
+    from vllm.prompt_adapter.request import PromptAdapterRequest 
+except Exception:
+    PromptAdapterRequest = None
+
+
 from verl import DataProto
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import is_npu_available
@@ -140,6 +146,17 @@ class vLLMRollout(BaseRollout):
             if model_config.lora_rank > 0
             else {}
         )
+
+        # ---- Prompt Adapter (soft prompt) knobs ----
+        self.prompt_adapter_cfg = getattr(config, "prompt_adapter", None)
+        self.pa_kwargs = {}
+        if self.prompt_adapter_cfg and self.prompt_adapter_cfg.get("enable", False):
+            pa_len = int(self.prompt_adapter_cfg.get("length", 20))
+            self.pa_kwargs = {
+                "enable_prompt_adapter": True,
+                "max_prompt_adapters": 1,
+                "max_prompt_adapter_token": pa_len,
+            }
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
@@ -237,6 +254,7 @@ class vLLMRollout(BaseRollout):
             seed=config.get("seed", 0),
             **compilation_config,
             **self.lora_kwargs,
+            **self.pa_kwargs, 
             **engine_kwargs,
         )
 
@@ -458,30 +476,92 @@ class vLLMRollout(BaseRollout):
 
         self.inference_engine.sleep(level=self.sleep_level)
 
+    # async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
+    #     """Update the weights of the rollout model.
+
+    #     Args:
+    #         weights: A generator that yields the name of the weight tensor and the tensor itself.
+    #     """
+    #     peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+    #     if peft_config and base_sync_done:
+    #         lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+    #         lora_reqest = TensorLoRARequest(
+    #             lora_name=f"{lora_int_id}",
+    #             lora_int_id=lora_int_id,
+    #             lora_path="simon_lora_path",
+    #             peft_config=asdict(peft_config),
+    #             lora_tensors=dict(weights),
+    #         )
+    #         self.inference_engine.llm_engine.add_lora(lora_reqest)
+    #         logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+    #     else:
+    #         from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+    #         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+    #         patch_vllm_moe_model_weight_loader(model)
+    #         model.load_weights(weights)
+
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
-
-        Args:
-            weights: A generator that yields the name of the weight tensor and the tensor itself.
+        Supports both LoRA adapters and Prompt Adapters (soft prompts).
         """
+        # ---- LoRA分支----
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-            lora_reqest = TensorLoRARequest(
+            lora_request = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",
                 lora_int_id=lora_int_id,
                 lora_path="simon_lora_path",
                 peft_config=asdict(peft_config),
                 lora_tensors=dict(weights),
             )
-            self.inference_engine.llm_engine.add_lora(lora_reqest)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
-        else:
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            self.inference_engine.llm_engine.add_lora(lora_request)
+            logger.info(f"[vLLM] Loaded LoRA adapter with {len(list(weights))} tensors.")
+            return  # ✅ LoRA 分支执行完毕后直接返回
 
+        # ---- Prompt Adapter 分支（新增）----
+        prompt_adapter_tensors = kwargs.get("prompt_adapter_tensors", None)
+        if prompt_adapter_tensors is not None:
+            try:
+                from vllm.prompt_adapter.request import PromptAdapterRequest
+            except ImportError:
+                PromptAdapterRequest = None
+
+            if PromptAdapterRequest is not None:
+                pa_int_id = int(time.time_ns() % 0x7FFFFFFF)
+                pa_request = PromptAdapterRequest(
+                    adapter_name=f"pa-{pa_int_id}",
+                    adapter_id=pa_int_id,
+                    adapter_path="/prompt-adapter-stub",  # 不需要真实路径，只占位
+                    prompt_adapter_tensors=dict(prompt_adapter_tensors),
+                )
+
+                # 根据 vLLM 的不同封装结构，自动选择注入入口
+                if hasattr(self.inference_engine, "llm_engine"):
+                    self.inference_engine.llm_engine.add_prompt_adapter(pa_request)
+                elif hasattr(self.inference_engine, "worker"):
+                    self.inference_engine.worker.add_prompt_adapter(pa_request)
+                else:
+                    raise RuntimeError("vLLM engine missing expected prompt adapter interface.")
+
+                logger.info(f"[vLLM] Loaded PromptAdapter, tensors: {list(prompt_adapter_tensors.keys())}")
+                return  # ✅ Prompt Adapter 分支执行完毕后直接返回
+            else:
+                logger.warning("[vLLM] PromptAdapterRequest not found in this vLLM version, skipping soft prompt load.")
+
+        # ---- fallback: 直接加载基础模型权重（原逻辑保留）----
+        from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+        if hasattr(self.inference_engine, "llm_engine"):
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-            patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+        else:
+            model = self.inference_engine.worker.model_runner.model
+
+        patch_vllm_moe_model_weight_loader(model)
+        model.load_weights(weights)
+        logger.info(f"[vLLM] Base weights loaded, tensors: {len(list(weights))}")
+
 
 
 # https://github.com/vllm-project/vllm/issues/13175

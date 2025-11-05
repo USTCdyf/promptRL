@@ -178,6 +178,10 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    enable_prompt_adapter: bool = False
+
+    prompt_adapter_path: Optional[str] = None
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:
